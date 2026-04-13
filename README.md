@@ -18,5 +18,5 @@ SysGuard es un script robusto desarrollado en **Bash** diseñado para el monitor
 ## 📦 Instalación y Uso
 1. Clonar el repositorio:
    ```bash
-   git clone [https://github.com/D0nFrancisco/sysguard.git](https://github.com/D0nFrancisco/sysguard.git)
+   git clone https://github.com/D0nFrancisco/sysguard.git](https://github.com/D0nFrancisco/sysguard.git
    cd sysguard
