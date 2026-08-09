@@ -1,0 +1,10 @@
+[Unit]
+Description=SysGuard system check
+Documentation=https://github.com/D0nFrancisco/sysguard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Ajusta esta ruta al directorio real donde desplegaste SysGuard.
+ExecStart=/opt/sysguard/sysguard --check

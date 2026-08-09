@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+# sysguard — CLI de monitoreo de sistema Linux. Ligera, sin dependencias
+# pesadas, pensada para correr interactivamente o vía cron/systemd.
+set -euo pipefail
+
+# Se captura el locale original ANTES de forzar C, para poder decidir si
+# la terminal anuncia soporte UTF-8 (lib/colors.sh la usa para elegir entre
+# símbolos Unicode o su equivalente ASCII). El orden de precedencia sigue
+# el de POSIX: LC_ALL > LC_CTYPE > LANG.
+export SYSGUARD_ORIGINAL_LOCALE="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+
+# Fuerza locale C para toda la ejecución: comandos como df/awk pueden
+# traducir encabezados o usar coma como separador decimal según el locale
+# del sistema (esto rompía el cálculo de CPU en la versión anterior, que
+# a veces producía "4,44155%"). Con LC_ALL=C el formato numérico y el texto
+# de las herramientas del sistema es siempre predecible.
+export LC_ALL=C
+
+readonly SYSGUARD_VERSION="2.0.0"
+
+# Resuelve el directorio real del proyecto siguiendo symlinks, para que
+# sysguard funcione igual si se invoca por ruta relativa, absoluta, o desde
+# un symlink en PATH (p. ej. /usr/local/bin/sysguard -> .../sysguard).
+_resolve_root() {
+    local src="${BASH_SOURCE[0]}"
+    local dir
+    while [[ -h "$src" ]]; do
+        dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd
+}
+
+# dirname/readlink son coreutils básicos (igual que head/tail/find, que sí
+# están en REQUIRED_CMDS), pero se usan aquí antes de que exista lib/util.sh
+# para reportar errores — check_dependencies() llega demasiado tarde para
+# cubrir este paso. Se evita el patrón "readonly X=$(cmd)": si cmd falla,
+# ese patrón absorbe el exit status y deja X vacío en vez de abortar
+# (mismo comportamiento que "local X=$(cmd)"), por lo que se separa
+# asignación y validación para sostener el contrato de exit codes (3=ERROR)
+# incluso en este fallo de bootstrap.
+SYSGUARD_ROOT="$(_resolve_root)" || {
+    echo "sysguard: error: no se pudo resolver el directorio del proyecto (revisa que 'dirname' y 'readlink' estén disponibles)." >&2
+    exit 3
+}
+readonly SYSGUARD_ROOT
+
+# shellcheck source=lib/util.sh
+source "$SYSGUARD_ROOT/lib/util.sh"
+# shellcheck source=lib/colors.sh
+source "$SYSGUARD_ROOT/lib/colors.sh"
+# shellcheck source=lib/config.sh
+source "$SYSGUARD_ROOT/lib/config.sh"
+# shellcheck source=lib/metrics.sh
+source "$SYSGUARD_ROOT/lib/metrics.sh"
+# shellcheck source=lib/thresholds.sh
+source "$SYSGUARD_ROOT/lib/thresholds.sh"
+# shellcheck source=lib/log.sh
+source "$SYSGUARD_ROOT/lib/log.sh"
+# shellcheck source=lib/alerts.sh
+source "$SYSGUARD_ROOT/lib/alerts.sh"
+# shellcheck source=lib/notify.sh
+source "$SYSGUARD_ROOT/lib/notify.sh"
+# shellcheck source=lib/history.sh
+source "$SYSGUARD_ROOT/lib/history.sh"
+# shellcheck source=lib/processes.sh
+source "$SYSGUARD_ROOT/lib/processes.sh"
+# shellcheck source=lib/dashboard.sh
+source "$SYSGUARD_ROOT/lib/dashboard.sh"
+# shellcheck source=lib/report.sh
+source "$SYSGUARD_ROOT/lib/report.sh"
+
+readonly REQUIRED_CMDS=(awk grep sed df ip date numfmt ps flock find du head tail)
+
+check_dependencies() {
+    local c
+    for c in "${REQUIRED_CMDS[@]}"; do
+        require_cmd "$c"
+    done
+}
+
+usage() {
+    cat <<EOF
+SysGuard $SYSGUARD_VERSION — monitoreo de sistema Linux
+
+USO:
+    sysguard [COMANDO]
+    sysguard [--COMANDO]
+
+Sin argumentos, sysguard muestra esta ayuda (igual que 'help').
+
+COMANDOS:
+    check        Chequeo único no interactivo (para cron/systemd/scripts).
+    network      Estado de la interfaz principal, IP, gateway y throughput.
+    system       Información general del host (kernel, CPU, RAM, uptime...).
+    dashboard    Panel interactivo en terminal.
+    report       Genera reports/status.html.
+    history      Consulta el historial de métricas (CSV).
+    processes    Top procesos por CPU/RAM.
+    help         Muestra esta ayuda.
+    version      Muestra la versión.
+
+Cada comando acepta también la forma --comando (p. ej. --check).
+
+EXIT CODES:
+    0 = OK        todas las métricas evaluadas están dentro de rango
+    1 = WARNING   alguna métrica superó su umbral WARNING
+    2 = CRITICAL  alguna métrica superó su umbral CRITICAL
+    3 = ERROR     fallo de ejecución, dependencia faltante o config inválida
+
+EJEMPLOS:
+    sysguard --check
+    sysguard network
+    ./sysguard --check ; echo "exit: \$?"
+EOF
+}
+
+_human_rate() {
+    local bytes=$1
+    numfmt --to=iec --suffix=/s "$bytes" 2>/dev/null || echo "${bytes} B/s"
+}
+
+# evaluate_and_log_alert KEY STATUS DETAIL — aplica cooldown vía alerts.sh,
+# escribe en el log estructurado según el resultado, y dispara la
+# notificación por webhook sobre NOTIFY_ALERT/NOTIFY_RECOVERY.
+evaluate_and_log_alert() {
+    local key=$1 status=$2 detail=$3
+    local result
+    result=$(alert_evaluate "$key" "$status")
+    case "$result" in
+        NOTIFY_ALERT)
+            case "$status" in
+                CRITICAL) log_event CRITICAL "$key $detail" ;;
+                WARNING) log_event WARN "$key $detail" ;;
+            esac
+            notify_dispatch "$key" "$status" "$detail"
+            ;;
+        NOTIFY_RECOVERY)
+            log_event INFO "$key recovered $detail"
+            notify_dispatch "$key" "$status" "$detail"
+            ;;
+    esac
+}
+
+_print_check_line() {
+    local label=$1 value=$2 status=$3
+    printf '%-9s %-24s %s%s %s%s\n' \
+        "$label" "$value" "$(status_color "$status")" "$(status_symbol "$status")" "$status" "$COLOR_RESET"
+}
+
+cmd_check() {
+    log_event INFO "check started"
+
+    metrics_collect_ram
+    metrics_collect_swap
+    metrics_collect_load
+    metrics_collect_uptime
+    metrics_collect_disks
+    metrics_collect_network
+
+    local iface="${NET_IFACE:-}"
+    metrics_collect_realtime "$iface"
+
+    local cpu_status ram_status swap_status net_status
+    cpu_status=$(threshold_status CPU "$CPU_PERCENT")
+    ram_status=$(threshold_status RAM "$RAM_PERCENT")
+    swap_status=$(threshold_status SWAP "$SWAP_PERCENT")
+    net_status=$(network_status "${NET_STATE:-down}")
+
+    compute_worst_disk
+    local worst_disk_status=$WORST_DISK_STATUS worst_disk_mount=$WORST_DISK_MOUNT worst_disk_pct=$WORST_DISK_PCT
+
+    local entry mnt type used total pct st
+    for entry in "${DISKS[@]:-}"; do
+        [[ -z "$entry" ]] && continue
+        IFS='|' read -r mnt type used total pct <<<"$entry"
+        st=$(threshold_status DISK "$pct")
+        evaluate_and_log_alert "DISK:$mnt" "$st" "value=${pct}% warning=${DISK_WARNING}% critical=${DISK_CRITICAL}%"
+    done
+
+    local overall
+    overall=$(worst_status "$cpu_status" "$ram_status" "$swap_status" "$worst_disk_status" "$net_status")
+
+    evaluate_and_log_alert "CPU" "$cpu_status" "value=${CPU_PERCENT}% warning=${CPU_WARNING}% critical=${CPU_CRITICAL}%"
+    evaluate_and_log_alert "RAM" "$ram_status" "value=${RAM_PERCENT}% warning=${RAM_WARNING}% critical=${RAM_CRITICAL}%"
+    evaluate_and_log_alert "SWAP" "$swap_status" "value=${SWAP_PERCENT}% warning=${SWAP_WARNING}% critical=${SWAP_CRITICAL}%"
+    evaluate_and_log_alert "NETWORK" "$net_status" "state=${NET_STATE:-down} iface=${iface:-none}"
+
+    printf '%sSysGuard CHECK%s — %s\n' "$COLOR_BOLD" "$COLOR_RESET" "$(now_iso)"
+    _print_check_line "CPU" "${CPU_PERCENT}%" "$cpu_status"
+    _print_check_line "RAM" "${RAM_PERCENT}%" "$ram_status"
+    _print_check_line "SWAP" "${SWAP_PERCENT}%" "$swap_status"
+    _print_check_line "DISK" "${worst_disk_pct}% (${worst_disk_mount})" "$worst_disk_status"
+    _print_check_line "NETWORK" "${NET_STATE:-down} (${iface:-sin interfaz})" "$net_status"
+    echo
+    printf 'STATUS: %s%s%s\n' "$(status_color "$overall")" "$overall" "$COLOR_RESET"
+
+    log_event INFO "check completed cpu=${CPU_PERCENT}% ram=${RAM_PERCENT}% swap=${SWAP_PERCENT}% disk=${worst_disk_pct}%(${worst_disk_mount}) status=${overall}"
+    log_purge_old
+
+    if [[ "${HISTORY_ENABLED:-true}" == "true" ]]; then
+        history_record "$CPU_PERCENT" "$RAM_PERCENT" "$SWAP_PERCENT" "$worst_disk_pct" "$LOAD1" "$NET_RX_RATE" "$NET_TX_RATE" "$overall"
+        history_prune
+    fi
+
+    exit "$(status_exit_code "$overall")"
+}
+
+cmd_network() {
+    metrics_collect_network
+    local iface="${NET_IFACE:-}"
+    metrics_collect_realtime "$iface"
+
+    echo "Interfaz principal : ${iface:-ninguna (sin ruta default)}"
+    echo "Estado             : ${NET_STATE:-down}"
+    echo "IP                 : ${NET_IP:-n/d}"
+    echo "Gateway            : ${NET_GATEWAY:-n/d}"
+    if [[ "${NET_SPEED:-n/d}" == "n/d" ]]; then
+        echo "Velocidad          : n/d"
+    else
+        echo "Velocidad          : ${NET_SPEED} Mbit/s"
+    fi
+    echo "RX                 : $(_human_rate "$NET_RX_RATE")"
+    echo "TX                 : $(_human_rate "$NET_TX_RATE")"
+
+    local st
+    st=$(network_status "${NET_STATE:-down}")
+    exit "$(status_exit_code "$st")"
+}
+
+cmd_system() {
+    metrics_collect_system
+    metrics_collect_ram
+    metrics_collect_swap
+    metrics_collect_load
+    metrics_collect_uptime
+
+    echo "Hostname     : $SYS_HOSTNAME"
+    echo "Distribución : $SYS_DISTRO"
+    echo "Kernel       : $SYS_KERNEL"
+    echo "Arquitectura : $SYS_ARCH"
+    echo "CPU          : $SYS_CPU_MODEL (${SYS_CPU_COUNT} núcleos)"
+    echo "RAM total    : $(numfmt --from-unit=1024 --to=iec "${RAM_TOTAL_KB}")"
+    echo "Swap total   : $(numfmt --from-unit=1024 --to=iec "${SWAP_TOTAL_KB}")"
+    echo "Uptime       : $UPTIME_HUMAN"
+    echo "Load average : $LOAD1 $LOAD5 $LOAD15"
+
+    exit "$EXIT_OK"
+}
+
+cmd_history() {
+    local window="24h"
+    if [[ "${1:-}" == "--last" ]]; then
+        window=${2:-24h}
+    fi
+
+    local hours label
+    case "$window" in
+        24h) hours=24; label="Últimas 24 horas" ;;
+        7d) hours=168; label="Últimos 7 días" ;;
+        *) die "valor inválido para --last: '$window' (usa 24h o 7d)" "$EXIT_ERROR" ;;
+    esac
+
+    if [[ "${HISTORY_ENABLED:-true}" != "true" ]]; then
+        echo "El historial está deshabilitado (HISTORY_ENABLED=false en config/sysguard.conf)."
+        exit "$EXIT_OK"
+    fi
+
+    history_stats "$hours"
+
+    if (( HIST_ROWS == 0 )); then
+        echo "Sin datos de historial en '$label'."
+        echo "Ejecuta 'sysguard --check' unas cuantas veces (o espera a que corra por cron) y vuelve a intentar."
+        exit "$EXIT_OK"
+    fi
+
+    echo "$label ($HIST_ROWS muestras)"
+    echo
+    echo "CPU"
+    echo "  Promedio: ${HIST_CPU_AVG}%"
+    echo "  Mínimo:   ${HIST_CPU_MIN}%"
+    echo "  Pico:     ${HIST_CPU_MAX}%"
+    echo
+    echo "RAM"
+    echo "  Promedio: ${HIST_RAM_AVG}%"
+    echo "  Mínimo:   ${HIST_RAM_MIN}%"
+    echo "  Pico:     ${HIST_RAM_MAX}%"
+    echo
+    echo "Disco (peor punto de montaje en cada check)"
+    echo "  Actual: ${HIST_DISK_CURRENT}%"
+    echo "  Cambio en el período: ${HIST_DISK_CHANGE}%"
+
+    exit "$EXIT_OK"
+}
+
+_print_process_table() {
+    local title=$1 sort_key=$2
+    echo "$title"
+    printf '%-8s %-12s %6s %6s %10s   %s\n' "PID" "USER" "CPU%" "MEM%" "RSS" "COMMAND"
+    local pid user pcpu pmem rss comm rss_h
+    while read -r pid user pcpu pmem rss comm; do
+        rss_h=$(numfmt --from-unit=1024 --to=iec "$rss" 2>/dev/null || echo "${rss}K")
+        printf '%-8s %-12s %5s%% %5s%% %10s   %s\n' "$pid" "$user" "$pcpu" "$pmem" "$rss_h" "$comm"
+    done < <(processes_top "$sort_key" 10)
+}
+
+cmd_processes() {
+    _print_process_table "TOP PROCESSES — CPU" cpu
+    echo
+    _print_process_table "TOP PROCESSES — MEMORY" mem
+    exit "$EXIT_OK"
+}
+
+cmd_report() {
+    report_generate
+    echo "Reporte generado en: $REPORT_DIR/status.html"
+    exit "$EXIT_OK"
+}
+
+cmd_dashboard() {
+    trap 'printf "\n"; exit 0' INT TERM
+
+    while true; do
+        metrics_collect_system
+        metrics_collect_ram
+        metrics_collect_swap
+        metrics_collect_load
+        metrics_collect_uptime
+        metrics_collect_disks
+        metrics_collect_network
+        metrics_collect_realtime "${NET_IFACE:-}"
+        compute_worst_disk
+
+        is_tty && clear
+        dashboard_render
+
+        # No repetir el frame si no hay terminal (script/pipe/test): una
+        # sola muestra y se sale, para no dejar procesos colgados en modo
+        # no interactivo. SYSGUARD_DASHBOARD_ONESHOT fuerza lo mismo con
+        # terminal real (lo usan los tests).
+        if ! is_tty || [[ "${SYSGUARD_DASHBOARD_ONESHOT:-}" == "1" ]]; then
+            break
+        fi
+    done
+
+    local cpu_status ram_status swap_status net_status overall
+    cpu_status=$(threshold_status CPU "$CPU_PERCENT")
+    ram_status=$(threshold_status RAM "$RAM_PERCENT")
+    swap_status=$(threshold_status SWAP "$SWAP_PERCENT")
+    net_status=$(network_status "${NET_STATE:-down}")
+    overall=$(worst_status "$cpu_status" "$ram_status" "$swap_status" "$WORST_DISK_STATUS" "$net_status")
+    exit "$(status_exit_code "$overall")"
+}
+
+main() {
+    local cmd=${1:-help}
+    cmd=${cmd#--}
+
+    case "$cmd" in
+        help|-h) usage; exit "$EXIT_OK" ;;
+        version|-v) echo "sysguard $SYSGUARD_VERSION"; exit "$EXIT_OK" ;;
+    esac
+
+    check_dependencies
+    load_config
+
+    case "$cmd" in
+        check) cmd_check ;;
+        network) cmd_network ;;
+        system) cmd_system ;;
+        processes) cmd_processes ;;
+        history) shift || true; cmd_history "$@" ;;
+        dashboard) cmd_dashboard ;;
+        report) cmd_report ;;
+        *)
+            echo "sysguard: comando desconocido: '$cmd'" >&2
+            usage >&2
+            exit "$EXIT_ERROR"
+            ;;
+    esac
+}
+
+main "$@"
